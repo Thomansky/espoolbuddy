@@ -5,7 +5,10 @@
 # entry-point YAML so there is exactly one number to update.
 esphome:
   project:
-    version: "0.27.0"
+    # Fork-Stand: Upstream v0.27.0 plus die Scan-Zuverlaessigkeit und die
+    # Tag-Anzeige. Der Suffix haelt den Stand von einem spaeteren echten
+    # Upstream-0.28.0 unterscheidbar, statt dessen Nummer vorwegzunehmen.
+    version: "0.27.0+lts3d.1"
 
 # Reports the same version to Home Assistant (via the native api: component,
 # already present in every entry-point YAML) as a diagnostic text sensor.

@@ -16,6 +16,22 @@ obj:
         text_align: CENTER
         align: CENTER
 
+    # Shown while a Bambu chip is on the reader that could not be read
+    # completely. This state deliberately offers no "add" button: there is
+    # nothing identifying to add, and the blank inventory entries this panel
+    # replaces were exactly what came of offering one anyway. The reader keeps
+    # trying on its own while the spool stays put, so the instruction is simply
+    # to leave it there or set it down again.
+    - label:
+        id: nfc_incomplete
+        width: 90%
+        text: "Chip not fully read\nLift the spool and set it down again"
+        text_font: roboto_20
+        text_color: 0xE8A33D
+        text_align: CENTER
+        align: CENTER
+        hidden: true
+
     # spool detail group
     - obj:
         id: nfc_spool_box
@@ -619,12 +635,62 @@ obj:
                     text_font: roboto_12
                     text_color: 0x9898C0
                     text_align: CENTER
+                # Headline. For a Bambu chip this becomes the filament itself —
+                # "PLA Matte" — because the firmware has decoded it by the time
+                # this panel appears. Only a tag that carries nothing readable
+                # falls back to the generic wording, and an incompletely read
+                # chip says so instead of pretending to be a new spool.
                 - label:
+                    id: nfc_unlinked_title
                     width: 100%
                     height: 26
                     text: "Tag not linked to any spool"
                     text_font: roboto_20
                     text_color: 0xBBBBCC
+                    text_align: CENTER
+                # Colour swatch + name, side by side. The swatch is the actual
+                # RGB from block 5, which is the fastest way to confirm you are
+                # looking at the spool you think you are.
+                - obj:
+                    id: nfc_unlinked_color_row
+                    width: SIZE_CONTENT
+                    height: 20
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    scrollbar_mode: "OFF"
+                    hidden: true
+                    layout:
+                      type: FLEX
+                      flex_flow: ROW
+                      flex_align_cross: CENTER
+                      pad_column: 6
+                    widgets:
+                      - obj:
+                          id: nfc_unlinked_swatch
+                          width: 14
+                          height: 14
+                          radius: 3
+                          bg_color: 0x000000
+                          bg_opa: COVER
+                          border_color: 0x6666AA
+                          border_width: 1
+                          pad_all: 0
+                          scrollbar_mode: "OFF"
+                      - label:
+                          id: nfc_unlinked_color
+                          text: ""
+                          text_font: roboto_12
+                          text_color: 0xBBBBCC
+                # Weight and variant number — the detail you would otherwise
+                # have to re-scan to check.
+                - label:
+                    id: nfc_unlinked_detail
+                    width: 100%
+                    height: 16
+                    text: ""
+                    text_font: roboto_12
+                    text_color: 0x9898C0
                     text_align: CENTER
                 - label:
                     id: nfc_unlinked_ttl

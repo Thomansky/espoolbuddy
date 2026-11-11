@@ -239,6 +239,12 @@ struct DisplayState {
   // uses this to ask for a re-placement instead of offering an "add to
   // inventory" button that would create a blank entry.
   bool nfc_read_incomplete = false;
+  // What the tag actually says, decoded from the raw blocks. The firmware has
+  // always decoded this; it simply never reached the screen, so the unlinked
+  // panel could only say "a tag" while knowing perfectly well that it was
+  // holding PLA Matte in Ivory White. Carried in the snapshot so the LVGL
+  // lambda can show it without reaching into the component's internals.
+  BambuTagInfo bambu_tag{};
   std::string last_tag_uid;
   FilamentInfo current_filament;
   float weight_grams = 0.0f;

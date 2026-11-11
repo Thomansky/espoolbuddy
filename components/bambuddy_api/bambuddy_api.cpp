@@ -661,6 +661,8 @@ void BambuddyAPIComponent::on_tag_scanned(const std::string &uid,
   // /scale/nfc/tag-scanned handler pass it in here, so a tag scanned on the
   // scale carries exactly the same detail as one scanned on the console.
   bambu_tag_info_ = (bambu != nullptr) ? *bambu : BambuTagInfo{};
+  // Same payload, but in the snapshot the display reads from.
+  display_state_.bambu_tag = bambu_tag_info_;
   display_state_.status_message = "Tag detected: " + uid;
   display_state_.nfc_read_incomplete = false;
   display_state_.nfc_scan_generation++;  // lets the UI detect new physical scans
@@ -740,6 +742,11 @@ void BambuddyAPIComponent::on_tag_removed(const std::string &uid) {
   lock_state();
   display_state_.tag_resolving = false;  // cancel any in-flight resolution
   display_state_.nfc_read_incomplete = false;
+  // bambu_tag is deliberately NOT cleared here. For an unlinked tag the panel
+  // stays up on a TTL after the spool is lifted, so that the user can still
+  // tap "Add to Inventory" — clearing the payload now would blank the very
+  // description they are reading. Every on_tag_scanned() overwrites it, so a
+  // stale payload can never end up attached to a different tag.
   if (display_state_.spool_selected || scale_mode_) {
     // Linked spool, OR scale-server mode: clear physical presence immediately.
     // In scale_mode_ the console manages its own sticky-TTL once it

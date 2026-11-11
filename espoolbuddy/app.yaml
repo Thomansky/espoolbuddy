@@ -956,6 +956,7 @@ interval:
 
             // Make sure other NFC panels are hidden
             lv_obj_add_flag(id(nfc_waiting),        LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(nfc_incomplete),     LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(nfc_unlinked_panel), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(nfc_picker_panel),   LV_OBJ_FLAG_HIDDEN);
 
@@ -970,13 +971,56 @@ interval:
             //     (dismiss_spool() clears spool_selected while the tag is still present)
             // Don't interrupt the picker if the user already opened it.
             lv_obj_add_flag(id(nfc_waiting),                 LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(nfc_incomplete),              LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(nfc_spool_box),               LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(nfc_archive_proposal_popup),  LV_OBJ_FLAG_HIDDEN);
             bool picker_open = !lv_obj_has_flag(id(nfc_picker_panel), LV_OBJ_FLAG_HIDDEN);
             if (!picker_open) {
               lv_obj_clear_flag(id(nfc_unlinked_panel), LV_OBJ_FLAG_HIDDEN);
+              lv_obj_add_flag(id(nfc_incomplete), LV_OBJ_FLAG_HIDDEN);
               lv_label_set_text(id(nfc_unlinked_uid),
                   s.last_tag_uid.empty() ? "" : ("UID " + s.last_tag_uid).c_str());
+
+              // Say what the tag actually is. The payload was decoded from the
+              // raw blocks when the chip was read, so this costs nothing but
+              // the labels — and it removes the re-scan the user otherwise
+              // needs to check whether it is PLA Matte or PLA Basic.
+              const auto &bt = s.bambu_tag;
+              if (bt.valid) {
+                std::string headline = !bt.detailed_type.empty() ? bt.detailed_type
+                                     : !bt.material.empty()      ? bt.material
+                                     : "Bambu Lab spool";
+                lv_label_set_text(id(nfc_unlinked_title), headline.c_str());
+
+                if (!bt.color_name.empty() || !bt.color_hex.empty()) {
+                  lv_obj_clear_flag(id(nfc_unlinked_color_row), LV_OBJ_FLAG_HIDDEN);
+                  lv_label_set_text(id(nfc_unlinked_color),
+                      bt.color_name.empty() ? ("#" + bt.color_hex).c_str()
+                                            : bt.color_name.c_str());
+                  if (bt.color_hex.size() == 6) {
+                    uint32_t rgb = (uint32_t)strtoul(bt.color_hex.c_str(), nullptr, 16);
+                    lv_obj_set_style_bg_color(id(nfc_unlinked_swatch),
+                                              lv_color_hex(rgb), LV_PART_MAIN);
+                  }
+                } else {
+                  lv_obj_add_flag(id(nfc_unlinked_color_row), LV_OBJ_FLAG_HIDDEN);
+                }
+
+                // Weight and variant number on one line, each only if known.
+                std::string detail;
+                if (bt.spool_weight > 0) detail = std::to_string(bt.spool_weight) + " g";
+                if (!bt.variant_id.empty()) {
+                  if (!detail.empty()) detail += "  ·  ";
+                  detail += bt.variant_id;
+                }
+                lv_label_set_text(id(nfc_unlinked_detail), detail.c_str());
+              } else {
+                // Nothing decodable (a foreign NTAG, say) — the old wording is
+                // still the honest one here.
+                lv_label_set_text(id(nfc_unlinked_title), "Tag not linked to any spool");
+                lv_obj_add_flag(id(nfc_unlinked_color_row), LV_OBJ_FLAG_HIDDEN);
+                lv_label_set_text(id(nfc_unlinked_detail), "");
+              }
               // TTL countdown (only shown while the tag has been removed but panel is sticky)
               if (s.unlinked_tag_expiry_ms > 0) {
                 uint32_t now_ms = millis();
@@ -1005,9 +1049,21 @@ interval:
             lv_obj_add_flag(id(nfc_archive_proposal_popup),  LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(nfc_picker_panel),            LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(nfc_write_banner),   LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(id(nfc_waiting),      LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(id(nfc_waiting),
-                s.tag_resolving ? "Identifying tag..." : "Waiting for tag...");
+
+            // A Bambu chip that is on the reader but unreadable never produces
+            // a scan, so it arrives here rather than on the unlinked panel.
+            // Show what is actually happening instead of "Waiting for tag...",
+            // which would be wrong in two ways: a tag is present, and the
+            // reader is not waiting but retrying.
+            if (s.nfc_read_incomplete) {
+              lv_obj_add_flag(id(nfc_waiting),       LV_OBJ_FLAG_HIDDEN);
+              lv_obj_clear_flag(id(nfc_incomplete),  LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_obj_add_flag(id(nfc_incomplete),    LV_OBJ_FLAG_HIDDEN);
+              lv_obj_clear_flag(id(nfc_waiting),     LV_OBJ_FLAG_HIDDEN);
+              lv_label_set_text(id(nfc_waiting),
+                  s.tag_resolving ? "Identifying tag..." : "Waiting for tag...");
+            }
           }
 
           // ---- NFC episode end → restore the pre-scan tab ----
