@@ -235,6 +235,10 @@ struct SpoolSummary {
 struct DisplayState {
   BackendState backend_state = BackendState::DISCONNECTED;
   NFCTagState nfc_state = NFCTagState::ABSENT;
+  // A Bambu chip is on the reader that could not be read completely. The UI
+  // uses this to ask for a re-placement instead of offering an "add to
+  // inventory" button that would create a blank entry.
+  bool nfc_read_incomplete = false;
   std::string last_tag_uid;
   FilamentInfo current_filament;
   float weight_grams = 0.0f;
@@ -499,8 +503,14 @@ class BambuddyAPIComponent : public Component {
   // snapshotted into the queued job while the caller still owns it.
   void on_tag_scanned(const std::string &uid, const std::string &tray_uuid,
                       int sak, const std::string &tag_type,
-                      const BambuTagInfo *bambu = nullptr);
+                      const BambuTagInfo *bambu = nullptr,
+                      const std::string &raw_blocks = "");
   void on_tag_removed(const std::string &uid);
+  // A Bambu chip is on the reader but could not be read completely. No scan is
+  // reported for it — this only puts the display in a state that asks the user
+  // to lift the spool and set it down again, and explicitly does NOT offer to
+  // add anything to the inventory, because there is nothing identifying to add.
+  void on_tag_read_incomplete(const std::string &uid);
 
   // ---- Callbacks from scale sensor ----
   void on_scale_reading(float grams, bool stable, int raw_adc = 0);
@@ -653,6 +663,9 @@ class BambuddyAPIComponent : public Component {
     // enqueue time so the HTTP task never reads a bambu_tag_info_ that a
     // later scan has already overwritten.
     BambuTagInfo bambu{};
+    // Raw MIFARE blocks as {"1":"<32 hex>",...}, snapshotted for the same
+    // reason. Empty for tags that carry no Bambu block layout.
+    std::string raw_blocks;
   };
 
   static void http_task_trampoline(void *arg);
@@ -711,7 +724,8 @@ class BambuddyAPIComponent : public Component {
   // (NFC path) and api_get_ams() (AMS-removal path).
   void activate_spool(FilamentInfo fi, const std::string &source_uid, TagSource source);
   bool api_tag_scanned(const std::string &uid, const std::string &tray_uuid,
-                       int sak, const std::string &tag_type);
+                       int sak, const std::string &tag_type,
+                       const std::string &raw_blocks = "");
   bool api_tag_removed(const std::string &uid);
   bool api_scale_reading(float grams, bool stable, int raw_adc);
   bool api_update_tare(float tare_offset);
@@ -755,7 +769,8 @@ class BambuddyAPIComponent : public Component {
   void api_scale_push_nfc_scanned(const std::string &uid,
                                    const std::string &tray_uuid,
                                    int sak, const std::string &tag_type,
-                                   const BambuTagInfo &bambu);
+                                   const BambuTagInfo &bambu,
+                                   const std::string &raw_blocks);
   void api_scale_push_nfc_removed(const std::string &uid);
   void api_scale_push_write_result(int spool_id, const std::string &uid,
                                     bool success, const std::string &msg);
@@ -853,6 +868,16 @@ class BambuddyAPIComponent : public Component {
   // scanned on the console itself.
   static std::string bambu_tag_json_fields(const BambuTagInfo &bt);
   static BambuTagInfo parse_bambu_tag_json(const std::string &json);
+  // Returns the raw text of a flat JSON object member, braces included, or ""
+  // if absent. Only used on payloads this firmware generates itself, which is
+  // why a brace-counting scan is enough and no JSON parser is pulled in.
+  static std::string parse_json_object_raw(const std::string &json,
+                                           const std::string &key);
+
+  // The backend repeats ssh_public_key in every heartbeat response. Answering
+  // it every time turned a one-off acknowledgement into a message every few
+  // seconds; remember what has already been answered and stay quiet after.
+  std::string ssh_key_answered_;
   static std::string bool_str(bool v) { return v ? "true" : "false"; }
   // Parse a specific string field from a minimal JSON response
   static std::string parse_json_string(const std::string &json,
@@ -896,6 +921,10 @@ class BambuddyAPIComponent : public Component {
   std::string retry_uid_;
   std::string retry_tray_uuid_;
   std::string retry_tag_type_;
+  // Raw blocks are cached with the rest of the scan: a retry that dropped them
+  // would reach the backend as a poorer payload than the first attempt, which
+  // is exactly the asymmetry this change set exists to remove.
+  std::string retry_raw_blocks_;
   int retry_sak_{0};
 
   // ------------------------------------------------------------------

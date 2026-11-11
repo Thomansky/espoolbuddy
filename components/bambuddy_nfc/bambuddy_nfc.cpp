@@ -579,6 +579,57 @@ std::string BambuddyNFCComponent::extract_tray_uuid(
   return "";
 }
 
+std::string BambuddyNFCComponent::raw_blocks_json(
+    const std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> &blocks) {
+  // The device already decodes these bytes locally for the display. Sending
+  // them along as well is not redundancy for its own sake: the backend decodes
+  // an AMS spool from the very same block layout, so handing it the raw blocks
+  // is what makes a hand scan and an AMS insert describe a spool identically.
+  // A decoding fix on the server then reaches scans from this reader too,
+  // without a firmware release.
+  if (blocks.empty()) return "";
+  std::string out = "{";
+  bool first = true;
+  for (const auto &b : blocks) {
+    char hex[33];
+    for (int i = 0; i < 16; i++) snprintf(hex + i * 2, 3, "%02X", b.second[i]);
+    hex[32] = '\0';
+    if (!first) out += ",";
+    first = false;
+    out += "\"" + std::to_string((int)b.first) + "\":\"" + hex + "\"";
+  }
+  out += "}";
+  return out;
+}
+
+void BambuddyNFCComponent::note_incomplete_read(const std::vector<uint8_t> &uid,
+                                                 const std::string &uid_str) {
+  const uint32_t now = millis();
+  if (uid != incomplete_uid_) {
+    incomplete_uid_      = uid;
+    incomplete_attempts_ = 0;
+  }
+  if (incomplete_attempts_ < 255) incomplete_attempts_++;
+
+  if (incomplete_attempts_ <= INCOMPLETE_FAST_ATTEMPTS) {
+    incomplete_next_try_ms_ = now;  // try again on the very next poll
+  } else {
+    incomplete_next_try_ms_ = now + INCOMPLETE_RETRY_INTERVAL_MS;
+  }
+
+  // Tell the UI once per chip, not once per attempt.
+  if (incomplete_attempts_ == 1) {
+    ESP_LOGW(NFC_TAG,
+             "Bambu chip %s could not be read completely - not reporting the "
+             "scan, will keep trying while it stays on the reader",
+             uid_str.c_str());
+    if (api_) api_->on_tag_read_incomplete(uid_str);
+  } else {
+    ESP_LOGD(NFC_TAG, "Bambu chip %s still incomplete (attempt %u)",
+             uid_str.c_str(), incomplete_attempts_);
+  }
+}
+
 // ============================================================================
 // Component lifecycle
 // ============================================================================
@@ -810,6 +861,7 @@ void BambuddyNFCComponent::poll_once() {
     // Any detection means a tag is on the reader, so the removal counter
     // restarts — including when the tag that arrived is a *different* one.
     miss_count_ = 0;
+    last_detect_ms_ = millis();
 
     // A detection while TAG_PRESENT is not proof that the same tag is still
     // lying there.  Presenting a spool's second tag, or swapping spools,
@@ -819,92 +871,144 @@ void BambuddyNFCComponent::poll_once() {
     // that is the difference between "either side works" and "only the side
     // I happened to present first works".  Compare the UID and treat a change
     // as removal + arrival, which is what physically happened.
-    const bool same_tag =
-        (state_ == NFCState::TAG_PRESENT && uid == current_uid_);
-
-    if (state_ != NFCState::TAG_PRESENT || !same_tag) {
-      if (state_ == NFCState::TAG_PRESENT) {
-        std::string old_uid = uid_to_hex(current_uid_);
-        ESP_LOGI(NFC_TAG, "Tag swapped without a gap: %s -> %s",
-                 old_uid.c_str(), uid_to_hex(uid).c_str());
-        if (api_) api_->on_tag_removed(old_uid);
-      }
-      // New tag detected
-      state_ = NFCState::TAG_PRESENT;
-      current_uid_ = uid;
-      current_sak_ = sak;
-
-      // Determine tag type
-      std::string tag_type;
-      if (sak == 0x08 || sak == 0x18) {
-        tag_type = "mifare_classic";
-      } else if (sak == 0x00 || sak == 0x04) {
-        tag_type = "ntag";
-      } else {
-        tag_type = "unknown";
-      }
-
-      std::string uid_str = uid_to_hex(uid);
-
-      // Try to read Bambu tag data for MIFARE Classic
-      std::string tray_uuid;
-      bambuddy_api::BambuTagInfo bambu_info;
-      if (sak == 0x08 || sak == 0x18) {
-        std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> blocks;
-        if (read_bambu_blocks_retry(uid, blocks)) {
-          tray_uuid   = extract_tray_uuid(blocks);
-          bambu_info  = parse_bambu_tag(blocks);
-          if (bambu_info.valid) {
-            ESP_LOGI(NFC_TAG,
-                     "Bambu tag decoded: %s / %s / %s (#%s) %u g, "
-                     "hotend %u-%u C, bed %u C",
-                     bambu_info.material.c_str(),
-                     bambu_info.subtype.empty() ? "-" : bambu_info.subtype.c_str(),
-                     bambu_info.color_name.c_str(), bambu_info.color_hex.c_str(),
-                     bambu_info.spool_weight, bambu_info.nozzle_temp_min,
-                     bambu_info.nozzle_temp_max, bambu_info.bed_temp);
-          }
-        }
-      }
-
-      ESP_LOGI(NFC_TAG, "Tag detected: uid=%s sak=0x%02X type=%s tray_uuid=%s",
-               uid_str.c_str(), sak, tag_type.c_str(), tray_uuid.c_str());
-
-      if (api_) {
-        // The decoded payload rides along with the scan instead of being set
-        // afterwards: on a scale device on_tag_scanned() queues the push to the
-        // console straight away, so anything set after the call would arrive
-        // too late to be forwarded.
-        api_->on_tag_scanned(uid_str, tray_uuid, (int)sak, tag_type,
-                             bambu_info.valid ? &bambu_info : nullptr);
-      }
-
-      // For NTAG tags: read NDEF pages and refine the format beyond SAK alone.
-      // This runs after on_tag_scanned() so the UI gets immediate feedback,
-      // and before attempt_pending_write() so we classify the current content.
-      if ((sak == 0x00 || sak == 0x04) && api_) {
-        std::string fmt = ntag_detect_ndef_format(1);
-        if (!fmt.empty()) {
-          ESP_LOGI(NFC_TAG, "NDEF format detected: %s", fmt.c_str());
-          api_->set_tag_format(fmt);
-        }
-      }
-
-      // A write command may already be queued (e.g. tag re-placed); try it.
-      attempt_pending_write(uid, sak);
-
-    } else {
+    if (state_ == NFCState::TAG_PRESENT && uid == current_uid_) {
       // Tag still on the reader from a previous cycle.  The write command
       // usually arrives here, a poll or two after the initial scan, via the
       // backend's heartbeat response.
       attempt_pending_write(current_uid_, current_sak_);
+      return;
     }
 
+    // Determine tag type
+    std::string tag_type;
+    if (sak == 0x08 || sak == 0x18) {
+      tag_type = "mifare_classic";
+    } else if (sak == 0x00 || sak == 0x04) {
+      tag_type = "ntag";
+    } else {
+      tag_type = "unknown";
+    }
+
+    std::string uid_str = uid_to_hex(uid);
+
+    // Read the Bambu payload *before* committing any state change.  An
+    // incomplete read then leaves the state machine exactly as it found it, so
+    // the next poll simply runs the whole series again while the chip lies
+    // there — and nothing has been announced to the backend in the meantime.
+    //
+    // This ordering is the fix for the empty inventory entries: the previous
+    // code transitioned to TAG_PRESENT first and reported the scan whatever
+    // the read returned, so a chip that was only half readable still arrived
+    // at the backend as "a tag with no tray UID", and the backend had no
+    // choice but to treat it as a new, blank spool.
+    std::string tray_uuid;
+    std::string raw_blocks;
+    bambuddy_api::BambuTagInfo bambu_info;
+    if (sak == 0x08 || sak == 0x18) {
+      if (uid == incomplete_uid_ && (int32_t)(millis() - incomplete_next_try_ms_) < 0)
+        return;  // backing off from a chip that keeps failing
+
+      std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> blocks;
+      if (!read_bambu_blocks_retry(uid, blocks)) {
+        note_incomplete_read(uid, uid_str);
+        return;
+      }
+      incomplete_uid_.clear();
+      incomplete_attempts_ = 0;
+
+      tray_uuid  = extract_tray_uuid(blocks);
+      raw_blocks = raw_blocks_json(blocks);
+      bambu_info = parse_bambu_tag(blocks);
+      if (bambu_info.valid) {
+        ESP_LOGI(NFC_TAG,
+                 "Bambu tag decoded: %s / %s / %s (#%s) %u g, "
+                 "hotend %u-%u C, bed %u C",
+                 bambu_info.material.c_str(),
+                 bambu_info.subtype.empty() ? "-" : bambu_info.subtype.c_str(),
+                 bambu_info.color_name.c_str(), bambu_info.color_hex.c_str(),
+                 bambu_info.spool_weight, bambu_info.nozzle_temp_min,
+                 bambu_info.nozzle_temp_max, bambu_info.bed_temp);
+      }
+    }
+
+    // The read succeeded, or this is not a MIFARE Classic tag at all (NTAG
+    // spools keep their existing path).  Only now does the arrival become
+    // real.
+    if (state_ == NFCState::TAG_PRESENT) {
+      std::string old_uid = uid_to_hex(current_uid_);
+      ESP_LOGI(NFC_TAG, "Tag swapped without a gap: %s -> %s",
+               old_uid.c_str(), uid_str.c_str());
+      if (api_) api_->on_tag_removed(old_uid);
+    }
+    state_ = NFCState::TAG_PRESENT;
+    current_uid_ = uid;
+    current_sak_ = sak;
+
+    ESP_LOGI(NFC_TAG, "Tag detected: uid=%s sak=0x%02X type=%s tray_uuid=%s",
+             uid_str.c_str(), sak, tag_type.c_str(), tray_uuid.c_str());
+
+    // Report debounce: the same chip reaches the backend at most once per
+    // SCAN_REPORT_DEBOUNCE_MS.  A spool nudged while it rests on the reader
+    // can otherwise leave and re-enter the field several times in a second,
+    // and every one of those is a scan the backend has to reconcile.
+    const bool recently_reported =
+        (uid == last_scan_uid_) &&
+        (millis() - last_scan_ms_ < SCAN_REPORT_DEBOUNCE_MS);
+
+    if (recently_reported) {
+      ESP_LOGD(NFC_TAG, "Scan of %s not reported: same chip %lu ms ago",
+               uid_str.c_str(),
+               (unsigned long)(millis() - last_scan_ms_));
+    } else if (api_) {
+      last_scan_uid_ = uid;
+      last_scan_ms_  = millis();
+      // The decoded payload rides along with the scan instead of being set
+      // afterwards: on a scale device on_tag_scanned() queues the push to the
+      // console straight away, so anything set after the call would arrive
+      // too late to be forwarded.
+      api_->on_tag_scanned(uid_str, tray_uuid, (int)sak, tag_type,
+                           bambu_info.valid ? &bambu_info : nullptr,
+                           raw_blocks);
+    }
+
+    // For NTAG tags: read NDEF pages and refine the format beyond SAK alone.
+    // This runs after on_tag_scanned() so the UI gets immediate feedback,
+    // and before attempt_pending_write() so we classify the current content.
+    if ((sak == 0x00 || sak == 0x04) && api_) {
+      std::string fmt = ntag_detect_ndef_format(1);
+      if (!fmt.empty()) {
+        ESP_LOGI(NFC_TAG, "NDEF format detected: %s", fmt.c_str());
+        api_->set_tag_format(fmt);
+      }
+    }
+
+    // A write command may already be queued (e.g. tag re-placed); try it.
+    attempt_pending_write(uid, sak);
+
   } else {
-    // No tag detected
+    // No tag detected.
+    //
+    // Forget the incomplete chip only once it has really been away, using the
+    // same grace period as removal. A chip that is sitting slightly askew is
+    // not detected on every single poll, and clearing the counters on the
+    // first empty poll would restart the "first failure" handling over and
+    // over — the back-off would never engage and the user would get the same
+    // message again every few hundred milliseconds.
+    if (!incomplete_uid_.empty() &&
+        (millis() - last_detect_ms_) >= TAG_REMOVE_GRACE_MS) {
+      incomplete_uid_.clear();
+      incomplete_attempts_ = 0;
+    }
+
     if (state_ == NFCState::TAG_PRESENT) {
       miss_count_++;
-      if (miss_count_ >= miss_threshold_) {
+      // Removal needs both a run of empty polls and a real gap in wall-clock
+      // time.  miss_threshold_ alone is about a second, which a hand passing
+      // over the reader is enough to produce; the backend then sees a removal
+      // and an arrival for a spool that never actually moved.  A genuinely
+      // different chip is still handled immediately, in the swap branch above.
+      if (miss_count_ >= miss_threshold_ &&
+          (millis() - last_detect_ms_) >= TAG_REMOVE_GRACE_MS) {
         std::string old_uid = uid_to_hex(current_uid_);
 
         ESP_LOGI(NFC_TAG, "Tag removed: %s", old_uid.c_str());

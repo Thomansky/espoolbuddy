@@ -291,7 +291,8 @@ void BambuddyAPIComponent::http_task_loop() {
       if (dequeue_job(job)) {
         switch (job.kind) {
           case HttpJob::SCALE_PUSH_NFC_SCANNED:
-            api_scale_push_nfc_scanned(job.s1, job.s2, job.i1, job.s3, job.bambu);
+            api_scale_push_nfc_scanned(job.s1, job.s2, job.i1, job.s3, job.bambu,
+                                       job.raw_blocks);
             break;
           case HttpJob::SCALE_PUSH_NFC_REMOVED:
             api_scale_push_nfc_removed(job.s1);
@@ -392,7 +393,7 @@ void BambuddyAPIComponent::http_task_loop() {
       did_work = true;
       switch (job.kind) {
         case HttpJob::TAG_SCANNED:
-          api_tag_scanned(job.s1, job.s2, job.i1, job.s3);
+          api_tag_scanned(job.s1, job.s2, job.i1, job.s3, job.raw_blocks);
           // Follow immediately with a heartbeat so a pending write_tag command
           // is fetched while the tag is still on the reader.
           api_heartbeat();
@@ -500,6 +501,7 @@ void BambuddyAPIComponent::http_task_loop() {
         job.s2   = retry_tray_uuid_;
         job.s3   = retry_tag_type_;
         job.i1   = retry_sak_;
+        job.raw_blocks = retry_raw_blocks_;
         enqueue_job(job);
         did_work = true;
       }
@@ -629,7 +631,8 @@ void BambuddyAPIComponent::on_tag_scanned(const std::string &uid,
                                            const std::string &tray_uuid,
                                            int sak,
                                            const std::string &tag_type,
-                                           const BambuTagInfo *bambu) {
+                                           const BambuTagInfo *bambu,
+                                           const std::string &raw_blocks) {
   ESP_LOGI(TAG, "Tag scanned: uid=%s tray_uuid=%s sak=0x%02X type=%s",
            uid.c_str(), tray_uuid.c_str(), sak, tag_type.c_str());
 
@@ -659,6 +662,7 @@ void BambuddyAPIComponent::on_tag_scanned(const std::string &uid,
   // scale carries exactly the same detail as one scanned on the console.
   bambu_tag_info_ = (bambu != nullptr) ? *bambu : BambuTagInfo{};
   display_state_.status_message = "Tag detected: " + uid;
+  display_state_.nfc_read_incomplete = false;
   display_state_.nfc_scan_generation++;  // lets the UI detect new physical scans
   display_state_.propose_archive = false;  // new scan cancels any pending archive proposal
   last_tag_source_ = TagSource::LOCAL;   // overridden to SCALE by console_http_scale_nfc_scanned
@@ -690,6 +694,7 @@ void BambuddyAPIComponent::on_tag_scanned(const std::string &uid,
     retry_uid_        = uid;
     retry_tray_uuid_  = tray_uuid;
     retry_tag_type_   = tag_type;
+    retry_raw_blocks_ = raw_blocks;
     retry_sak_        = sak;
     HttpJob job;
     job.kind = HttpJob::TAG_SCANNED;
@@ -697,6 +702,7 @@ void BambuddyAPIComponent::on_tag_scanned(const std::string &uid,
     job.s2 = tray_uuid;
     job.s3 = tag_type;
     job.i1 = sak;
+    job.raw_blocks = raw_blocks;
     enqueue_job(job);
   } else if (!console_urls_.empty()) {
     // Scale push mode: forward tag event to the console, decoded Bambu
@@ -709,14 +715,31 @@ void BambuddyAPIComponent::on_tag_scanned(const std::string &uid,
     job.s3 = tag_type;
     job.i1 = sak;
     if (bambu != nullptr) job.bambu = *bambu;
+    job.raw_blocks = raw_blocks;
     enqueue_job(job);
   }
+}
+
+void BambuddyAPIComponent::on_tag_read_incomplete(const std::string &uid) {
+  // Deliberately does not touch nfc_state, does not increment
+  // nfc_scan_generation and queues no HTTP work. A chip that could not be read
+  // is not a scan: there is nothing to tell the backend and nothing to offer
+  // adding to the inventory. The only thing that changes is what the display
+  // asks the user to do.
+  ESP_LOGW(TAG, "Tag %s read incomplete — asking for a re-placement", uid.c_str());
+  lock_state();
+  display_state_.nfc_read_incomplete = true;
+  display_state_.tag_resolving       = false;
+  display_state_.status_message =
+      "Chip not fully read - lift the spool and set it down again";
+  unlock_state();
 }
 
 void BambuddyAPIComponent::on_tag_removed(const std::string &uid) {
   ESP_LOGI(TAG, "Tag removed: uid=%s", uid.c_str());
   lock_state();
   display_state_.tag_resolving = false;  // cancel any in-flight resolution
+  display_state_.nfc_read_incomplete = false;
   if (display_state_.spool_selected || scale_mode_) {
     // Linked spool, OR scale-server mode: clear physical presence immediately.
     // In scale_mode_ the console manages its own sticky-TTL once it
@@ -946,10 +969,11 @@ bool BambuddyAPIComponent::api_register_device() {
 
   // SSH key deployment — not supported on ESPHome, log and ignore
   std::string ssh_key = parse_json_string(resp, "ssh_public_key");
-  if (!ssh_key.empty()) {
+  if (!ssh_key.empty() && ssh_key != ssh_key_answered_) {
     ESP_LOGI(TAG,
              "SSH key deployment not supported on ESPHome (mocked response). "
              "Key ignored.");
+    ssh_key_answered_ = ssh_key;
     // Return a mocked "OK" to the backend via system_command_result
     api_system_command_result("deploy_ssh_key", true,
                               "SSH not supported on ESPHome device");
@@ -1010,10 +1034,18 @@ void BambuddyAPIComponent::api_heartbeat() {
   // liveness by the maintenance block in http_task_loop().
   unlock_state();
 
-  // Handle SSH key in heartbeat response (same mock as registration)
+  // Handle SSH key in heartbeat response (same mock as registration).
+  //
+  // The backend repeats ssh_public_key in *every* heartbeat response, not just
+  // the one that follows a deployment request. Answering it each time turned a
+  // single acknowledgement into a POST every few seconds — around 190 of them
+  // per ten minutes on a device with a short heartbeat interval, none of which
+  // followed a command the device had actually run. Answer once per distinct
+  // key and stay quiet afterwards; a genuinely new key still gets its reply.
   std::string ssh_key = parse_json_string(resp, "ssh_public_key");
-  if (!ssh_key.empty()) {
+  if (!ssh_key.empty() && ssh_key != ssh_key_answered_) {
     ESP_LOGD(TAG, "SSH key in heartbeat ignored (not supported on ESPHome)");
+    ssh_key_answered_ = ssh_key;
     api_system_command_result("deploy_ssh_key", true,
                               "SSH not supported on ESPHome device");
   }
@@ -1128,17 +1160,22 @@ void BambuddyAPIComponent::activate_spool(FilamentInfo fi,
 bool BambuddyAPIComponent::api_tag_scanned(const std::string &uid,
                                             const std::string &tray_uuid,
                                             int sak,
-                                            const std::string &tag_type) {
-  ESP_LOGI(TAG, "api_tag_scanned: POST uid=%s tray_uuid=%s sak=0x%02X type=%s",
-           uid.c_str(), tray_uuid.c_str(), sak, tag_type.c_str());
+                                            const std::string &tag_type,
+                                            const std::string &raw_blocks) {
+  ESP_LOGI(TAG, "api_tag_scanned: POST uid=%s tray_uuid=%s sak=0x%02X type=%s blocks=%s",
+           uid.c_str(), tray_uuid.c_str(), sak, tag_type.c_str(),
+           raw_blocks.empty() ? "-" : "yes");
   std::ostringstream js;
   js << "{"
      << "\"device_id\":" << json_string(device_id_) << ","
      << "\"tag_uid\":" << json_string(uid) << ","
      << "\"tray_uuid\":" << json_string(tray_uuid) << ","
      << "\"sak\":" << sak << ","
-     << "\"tag_type\":" << json_string(tag_type)
-     << "}";
+     << "\"tag_type\":" << json_string(tag_type);
+  // Raw blocks go out as an object, not a string, so the backend can decode
+  // them with the same code path it uses for an AMS spool.
+  if (!raw_blocks.empty()) js << ",\"raw_blocks\":" << raw_blocks;
+  js << "}";
   std::string resp;
   bool ok = http_post("/nfc/tag-scanned", js.str(), resp);
 
@@ -2829,14 +2866,16 @@ void BambuddyAPIComponent::api_scale_push_nfc_scanned(const std::string &uid,
                                                         const std::string &tray_uuid,
                                                         int sak,
                                                         const std::string &tag_type,
-                                                        const BambuTagInfo &bambu) {
+                                                        const BambuTagInfo &bambu,
+    const std::string &raw_blocks)
+    {
   if (console_urls_.empty()) return;
 
   // Built as a std::string rather than a fixed char[]: the decoded Bambu
   // payload adds up to ~400 bytes of names and colours on top of the base
   // fields, which would silently truncate in the old 384-byte buffer.
   std::string body;
-  body.reserve(640);
+  body.reserve(1024);
   body  = "{";
   body += "\"uid\":" + json_string(uid) + ",";
   body += "\"tray_uuid\":" + json_string(tray_uuid) + ",";
@@ -2844,6 +2883,10 @@ void BambuddyAPIComponent::api_scale_push_nfc_scanned(const std::string &uid,
   body += "\"tag_type\":" + json_string(tag_type);
   std::string bambu_fields = bambu_tag_json_fields(bambu);
   if (!bambu_fields.empty()) body += "," + bambu_fields;
+  // Forward the raw blocks unchanged. A spool scanned on the scale must reach
+  // the backend as the same payload it would have had if it were scanned on
+  // the console, or the two readers would describe one spool differently.
+  if (!raw_blocks.empty()) body += ",\"raw_blocks\":" + raw_blocks;
   body += "}";
 
   if (bambu.valid)
@@ -3090,6 +3133,9 @@ esp_err_t BambuddyAPIComponent::console_http_scale_nfc_scanned(httpd_req_t *req)
   // it — parse_bambu_tag_json() then returns an invalid struct and the console
   // falls back to the generic placeholder exactly as before.
   BambuTagInfo bambu = parse_bambu_tag_json(json);
+  // Older scale firmware sends no raw_blocks; the console then forwards none,
+  // exactly as before.
+  std::string raw_blocks = parse_json_object_raw(json, "raw_blocks");
 
   if (uid.empty()) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "uid required");
@@ -3105,7 +3151,7 @@ esp_err_t BambuddyAPIComponent::console_http_scale_nfc_scanned(httpd_req_t *req)
 
   // Route through the unified NFC path — identical to a locally-scanned tag.
   self->on_tag_scanned(uid, tray_uuid, sak, tag_type.empty() ? "unknown" : tag_type,
-                       bambu.valid ? &bambu : nullptr);
+                       bambu.valid ? &bambu : nullptr, raw_blocks);
   // Override source AFTER on_tag_scanned() so write_tag commands are routed back
   // to the scale's PN532 rather than waiting on the console's reader.
   self->last_tag_source_ = TagSource::SCALE;
@@ -3478,6 +3524,31 @@ std::string BambuddyAPIComponent::bambu_tag_json_fields(const BambuTagInfo &bt) 
   js += "\"bambu_drying_temp\":" + std::to_string(bt.drying_temp) + ",";
   js += "\"bambu_drying_time\":" + std::to_string(bt.drying_time);
   return js;
+}
+
+std::string BambuddyAPIComponent::parse_json_object_raw(const std::string &json,
+                                                         const std::string &key) {
+  const std::string needle = "\"" + key + "\"";
+  size_t k = json.find(needle);
+  if (k == std::string::npos) return "";
+  size_t c = json.find(':', k + needle.size());
+  if (c == std::string::npos) return "";
+  size_t open_brace = json.find_first_not_of(" \t\r\n", c + 1);
+  if (open_brace == std::string::npos || json[open_brace] != '{') return "";
+  int depth = 0;
+  bool in_str = false, esc = false;
+  for (size_t i = open_brace; i < json.size(); i++) {
+    char ch = json[i];
+    if (esc)            { esc = false; continue; }
+    if (ch == '\\')     { esc = true;  continue; }
+    if (ch == '"')      { in_str = !in_str; continue; }
+    if (in_str) continue;
+    if (ch == '{') depth++;
+    else if (ch == '}') {
+      if (--depth == 0) return json.substr(open_brace, i - open_brace + 1);
+    }
+  }
+  return "";  // unbalanced — treat as absent rather than forwarding junk
 }
 
 BambuTagInfo BambuddyAPIComponent::parse_bambu_tag_json(const std::string &json) {

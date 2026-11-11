@@ -64,14 +64,24 @@ static const uint8_t BAMBU_CONTEXT[7] = {
 // measurement only (logged, not yet used for matching).
 static const uint8_t BAMBU_BLOCKS[] = {1, 2, 4, 5, 6, 9};
 
-// Blocks the caller cannot do without: material identity and colour. A failure
-// on any of these makes the scan useless, so it aborts the attempt.
-// Everything else in BAMBU_BLOCKS is a bonus — block 6 adds temperatures and
-// block 9 the tray UID. Losing one of those costs a detail, not the scan, so a
-// failure there is logged and skipped rather than discarding blocks that were
-// already read successfully. This matters because each additional sector costs
-// another authentication, and the RF link is not always good for that long.
-static const uint8_t BAMBU_BLOCKS_REQUIRED[] = {1, 2, 4, 5};
+// Blocks the caller cannot do without: material identity and colour from
+// sectors 0 and 1, and the tray UID from sector 2. A failure on any of these
+// aborts the attempt so the retry loop below re-selects the tag and tries the
+// whole series again.
+//
+// Block 9 is on this list because the tray UID is not a detail — it is the
+// identity of the physical spool. Both tags of a Bambu spool carry the same
+// value, so it is the only field that tells the backend "this is the other
+// side of a spool you already have" instead of "this is a new spool". A scan
+// that reaches the backend without it is not a slightly poorer scan: it is the
+// scan that creates the duplicate. Treating it as optional also meant a failed
+// sector-2 authentication never reached read_bambu_blocks_retry(), because
+// read_bambu_blocks() returned true — so the one case that most needed a
+// retry was the one case that never got one.
+//
+// Block 6 stays optional: temperatures are genuinely a detail, and losing them
+// costs a nicety rather than the spool's identity.
+static const uint8_t BAMBU_BLOCKS_REQUIRED[] = {1, 2, 4, 5, 9};
 
 inline bool bambu_block_is_required(uint8_t block) {
   for (uint8_t b : BAMBU_BLOCKS_REQUIRED)
@@ -85,6 +95,28 @@ inline bool bambu_block_is_required(uint8_t block) {
 // reader. Retry the series a few times while the same tag stays present.
 static const uint8_t BAMBU_READ_ATTEMPTS = 4;
 static const uint16_t BAMBU_RETRY_DELAY_MS = 30;
+
+// A Bambu chip that is on the reader but cannot be read completely must not be
+// reported as a scan: the backend would receive a tag UID with no tray UID and
+// create an empty, duplicate-prone inventory entry out of it. Instead the
+// reader keeps trying while the chip lies there. The first few series run back
+// to back so a chip that is merely sitting slightly askew recovers within a
+// moment; after that the retries space out, so a card that simply is not a
+// readable Bambu tag does not keep the RF field busy indefinitely.
+static const uint8_t  INCOMPLETE_FAST_ATTEMPTS = 3;
+static const uint32_t INCOMPLETE_RETRY_INTERVAL_MS = 2000;
+
+// The same chip is reported to the backend at most once per this window.
+// Without it, a chip that flickers in and out of the field — the usual result
+// of a spool being nudged while it rests on the reader — produces a burst of
+// scans, each of which the backend has to reconcile.
+static const uint32_t SCAN_REPORT_DEBOUNCE_MS = 2000;
+
+// How long the chip has to stay out of the field before removal is reported.
+// miss_threshold_ alone is about a second, which a passing hand is enough to
+// trigger. Note this governs only the *gap* case: a different chip appearing
+// is still treated as an immediate swap, because that is what it is.
+static const uint32_t TAG_REMOVE_GRACE_MS = 2000;
 
 enum class NFCState {
   IDLE,
@@ -208,6 +240,17 @@ class BambuddyNFCComponent
   static std::string extract_tray_uuid(
       const std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> &blocks);
 
+  // Serialises the blocks that were actually read as {"1":"<32 hex>",...}.
+  // The backend decodes the same bytes the AMS decodes, so device and server
+  // cannot end up disagreeing about what is on the spool.
+  // Records that a Bambu chip is present but unreadable, schedules the next
+  // attempt and tells the API once (not once per attempt).
+  void note_incomplete_read(const std::vector<uint8_t> &uid,
+                            const std::string &uid_str);
+
+  static std::string raw_blocks_json(
+      const std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> &blocks);
+
   // ---- State ----
   GPIOPin *irq_pin_{nullptr};
   bambuddy_api::BambuddyAPIComponent *api_{nullptr};
@@ -216,6 +259,17 @@ class BambuddyNFCComponent
   uint8_t current_sak_{0};
   uint8_t miss_count_{0};
   uint8_t miss_threshold_{3};
+  // Chip that is present but has not yet been read completely. While this is
+  // set the reader stays in IDLE on purpose, so the next poll re-runs the whole
+  // read series instead of taking the "same tag, nothing to do" branch.
+  std::vector<uint8_t> incomplete_uid_;
+  uint8_t  incomplete_attempts_{0};
+  uint32_t incomplete_next_try_ms_{0};
+  // Last scan actually reported, for the report debounce.
+  std::vector<uint8_t> last_scan_uid_;
+  uint32_t last_scan_ms_{0};
+  // Last time any tag was seen, for the removal grace period.
+  uint32_t last_detect_ms_{0};
   uint32_t poll_interval_ms_{300};
   std::atomic<bool> low_power_{false};  // true while the console sleeps → slow polling
   std::atomic<bool> scan_enabled_{true};  // false → skip detection entirely (RF off)
