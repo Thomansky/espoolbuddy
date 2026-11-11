@@ -6,9 +6,15 @@
 esphome:
   project:
     # Fork-Stand: Upstream v0.27.0 plus die Scan-Zuverlaessigkeit und die
-    # Tag-Anzeige. Der Suffix haelt den Stand von einem spaeteren echten
-    # Upstream-0.28.0 unterscheidbar, statt dessen Nummer vorwegzunehmen.
-    version: "0.27.0+lts3d.1"
+    # Tag-Anzeige.
+    #
+    # Deliberately a plain SemVer number. The first attempt used build
+    # metadata, "0.27.0+lts3d.1", which is valid SemVer but goes out in the
+    # registration body as firmware_version — and the backend rejected the
+    # whole body with 422, so the device could not register at all and retried
+    # every five seconds. Whatever this string is, it has to survive the
+    # backend's own validation first.
+    version: "0.27.1"
 
 # Reports the same version to Home Assistant (via the native api: component,
 # already present in every entry-point YAML) as a diagnostic text sensor.
